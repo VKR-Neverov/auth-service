@@ -1,0 +1,6 @@
+signing-key: jhk!kj4378bvk3f98JBNMu3njnHK
+token-ttl: 12h
+
+redis-host: auth-service-redis-stg:6379
+
+kafka-brokers: "kafka-stg:9094"

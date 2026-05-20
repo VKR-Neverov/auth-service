@@ -1,0 +1,6 @@
+signing-key: 2q2PDfGTf3Qm00PCnigj
+token-ttl: 12h
+
+redis-host: auth-service-redis-prod:6379
+
+kafka-brokers: "kafka-prod:9093"

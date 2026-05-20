@@ -1,0 +1,149 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - 'master'
+
+jobs:
+  prepare:
+    runs-on: self-hosted
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+
+      - name: Get app name
+        run: |
+          BRANCH_NAME="${GITHUB_REF#refs/heads/}"
+          REPO_NAME=${{ github.event.repository.name }}
+          
+          # Check if the branch name is "master"
+          if [ $BRANCH_NAME = "master" ]; then
+            APP_NAME=$REPO_NAME
+          else
+            APP_NAME="${REPO_NAME}_${BRANCH_NAME}"
+          fi
+          
+          APP_NAME_STAGE="${APP_NAME}-stage"
+          
+          echo "APP_NAME=$APP_NAME" >> vars.env
+          echo "APP_NAME_STAGE=$APP_NAME_STAGE" >> vars.env
+          
+          echo $APP_NAME
+          echo $APP_NAME_STAGE
+
+      - name: Generate swagger
+        run: |
+          ls
+#          PROXY_PORT=$((RANDOM % (65000 - 5000 + 1) + 5000))
+#          SWAGGER_PORT=$((RANDOM % (65000 - 5000 + 1) + 5000))
+#
+#          echo "PROXY_PORT=$PROXY_PORT" >> vars.env
+#          echo "SWAGGER_PORT=$SWAGGER_PORT" >> vars.env
+#
+#          # clone swaggerui
+#          git clone https://github.com/fidesyx/platform
+#          cp -r platform/swaggerui .
+#
+#          make generate-swagger SERVER_HOST=${{ vars.SERVER_HOST }} PROXY_PORT=$PROXY_PORT PROJECT_NAME=${{ github.event.repository.name }}
+
+      - name: Import Secrets
+        uses: hashicorp/vault-action@v2.7.4
+        id: import-secrets
+        env:
+          ACTIONS_ALLOW_UNSECURE_COMMANDS: true
+        with:
+          url: http://localhost:8200
+          token: ${{ secrets.VAULT_TOKEN }}
+          secrets: |
+            secrets/stg/${{ github.event.repository.name }}/redis-password redis-password | REDIS_PASSWORD_STG;
+            secrets/stg/${{ github.event.repository.name }}/signing-key signing-key | SIGNING_KEY_STG;
+            
+            secrets/prod/${{ github.event.repository.name }}/redis-password redis-password | REDIS_PASSWORD_PROD;
+            secrets/prod/${{ github.event.repository.name }}/signing-key signing-key | SIGNING_KEY_PROD;
+
+      - name: Save secrets
+        run: |
+          echo "REDIS_PASSWORD_STG=${{ steps.import-secrets.outputs.REDIS_PASSWORD_STG }}" >> vars.env
+          echo "SIGNING_KEY_STG=${{ steps.import-secrets.outputs.SIGNING_KEY_STG }}" >> vars.env
+          
+          echo "REDIS_PASSWORD_PROD=${{ steps.import-secrets.outputs.REDIS_PASSWORD_PROD }}" >> vars.env
+          echo "SIGNING_KEY_PROD=${{ steps.import-secrets.outputs.SIGNING_KEY_PROD }}" >> vars.env
+
+  clean:
+    runs-on: self-hosted
+    needs: prepare
+    steps:
+      - name: Remove production container and image
+        run: |
+          source vars.env
+          
+          if docker inspect $APP_NAME > /dev/null 2>&1; then docker rm -f $APP_NAME && docker rmi -f $APP_NAME; else echo "Container not found."; fi
+
+      - name: Remove staging latest container and image
+        run: |
+          source vars.env
+          
+          if docker inspect $APP_NAME_STAGE > /dev/null 2>&1; then docker rm -f $APP_NAME_STAGE && docker rmi -f $APP_NAME_STAGE; else echo "Container not found."; fi
+
+  build:
+    runs-on: self-hosted
+    needs: clean
+    steps:
+      - name: Build binary
+        run: |
+          GOARCH=amd64 GOOS=linux go build -o ./bin/main ./cmd/${{ github.event.repository.name }}
+
+  staging-latest:
+    name: Staging latest
+    runs-on: self-hosted
+    needs: build
+    steps:
+      - name: Staging latest
+        run: |
+          source vars.env
+          
+          # generate random ports          
+          GRPC_PORT=$((RANDOM % (65000 - 5000 + 1) + 5000))
+          METRICS_PORT=40101
+          
+          docker build --tag $APP_NAME_STAGE .
+          
+          docker run --name $APP_NAME_STAGE -d \
+             --restart always \
+             --network zoo \
+             -e REDIS_PASSWORD=$REDIS_PASSWORD_STG \
+             -e SIGNING_KEY=$SIGNING_KEY_STG \
+             -e APP_NAME=$APP_NAME_STAGE \
+             -e ENV=STAGING \
+             -e GRPC_PORT=$GRPC_PORT -p $GRPC_PORT:$GRPC_PORT \
+             -e METRICS_PORT=$METRICS_PORT -p $METRICS_PORT:$METRICS_PORT \
+              $APP_NAME_STAGE
+          
+          echo http://${{ vars.SERVER_HOST }}:$SWAGGER_PORT/docs
+
+  deploy:
+    name: Deploy
+    runs-on: self-hosted
+    needs: build
+    steps:
+      - name: Build and run docker container
+        run: |
+          source vars.env
+          
+          # generate random ports          
+          GRPC_PORT=$((RANDOM % (65000 - 5000 + 1) + 5000))
+          METRICS_PORT=40100
+          
+          docker build --tag $APP_NAME .
+          
+          docker run --name $APP_NAME -d \
+             --restart always \
+             --network zoo \
+             -e REDIS_PASSWORD=$REDIS_PASSWORD_PROD \
+             -e SIGNING_KEY=$SIGNING_KEY_PROD \
+             -e APP_NAME=$APP_NAME \
+             -e ENV=PRODUCTION \
+             -e GRPC_PORT=$GRPC_PORT \
+             -e METRICS_PORT=$METRICS_PORT \
+              $APP_NAME
